@@ -221,6 +221,10 @@ pub struct FcmpPlusPlus {
   fcmp: Fcmp<Curves>,
 }
 
+fn input_tuple_and_sal_proof_size(inputs: usize) -> usize {
+  inputs * ((3 * 32) + (12 * 32))
+}
+
 impl FcmpPlusPlus {
   /// Create a new FCMP++ proof from its components.
   pub fn new(
@@ -233,7 +237,7 @@ impl FcmpPlusPlus {
   /// The size of a FCMP++ proof.
   pub fn proof_size(inputs: usize, layers: usize) -> usize {
     // Each input tuple, without C~, each SAL, and the FCMP
-    (inputs * ((3 * 32) + (12 * 32))) + Fcmp::<Curves>::proof_size(inputs, layers)
+    input_tuple_and_sal_proof_size(inputs) + Fcmp::<Curves>::proof_size(inputs, layers)
   }
 
   /// Write a FCMP++ proof.
@@ -255,7 +259,7 @@ impl FcmpPlusPlus {
   /// that.
   pub fn read(
     pseudo_outs: &Vec<CompressedPoint>,
-    layers: usize,
+    proof_len: usize,
     reader: &mut impl io::Read,
   ) -> io::Result<Self> {
     let mut inputs = vec![];
@@ -265,7 +269,9 @@ impl FcmpPlusPlus {
         SpendAuthAndLinkability::read(reader)?,
       ));
     }
-    let fcmp = Fcmp::read(reader, pseudo_outs.len(), layers)?;
+    // FIXME: use checked_sub
+    let membership_proof_len = proof_len - input_tuple_and_sal_proof_size(inputs.len());
+    let fcmp = Fcmp::read(reader, membership_proof_len)?;
     Ok(Self { inputs, fcmp })
   }
 
