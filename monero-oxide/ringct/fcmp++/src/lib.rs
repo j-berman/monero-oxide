@@ -74,7 +74,8 @@ impl FcmpCurves for Curves {
 
 include!(concat!(env!("OUT_DIR"), "/generators.rs"));
 
-pub(crate) static T: LazyLock<EdwardsPoint> =
+/// Monero's `T`, used to blind the key-image commitment present within output keys.
+pub static T: LazyLock<EdwardsPoint> =
   LazyLock::new(|| EdwardsPoint(CompressedPoint::T.decompress().unwrap().into()));
 
 /// The parameters for an FCMP.
