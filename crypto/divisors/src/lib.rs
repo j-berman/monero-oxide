@@ -57,6 +57,13 @@ pub trait DivisorCurve: Group + ConstantTimeEq + ConditionallySelectable + Zeroi
   ///
   /// This function may run in time variable to if the point is the identity.
   fn to_xy(point: Self) -> Option<(Self::FieldElement, Self::FieldElement)>;
+
+  /// Convert a point to its affine x coordinate.
+  ///
+  /// Returns `None` if passed the point at infinity.
+  ///
+  /// This function may run in time variable to if the point is the identity.
+  fn to_x(point: Self) -> Option<Self::FieldElement>;
 }
 
 type Xy<C> = (<C as DivisorCurve>::FieldElement, <C as DivisorCurve>::FieldElement);
@@ -572,6 +579,63 @@ mod ed25519 {
 
   use crate::{Projective, Interpolator};
 
+  use crypto_bigint::{
+    modular::runtime_mod::{DynResidueParams, DynResidue},
+    U256,
+  };
+
+  const MODULUS: DynResidueParams<{ U256::LIMBS }> =
+    DynResidueParams::new(&U256::ONE.shl_vartime(255).wrapping_sub(&U256::from_u64(19)));
+
+  struct EdDerivatives {
+    x_is_odd: u8,
+    edwards_y: FieldElement,
+    edwards_y_plus_one: FieldElement,
+    one_minus_edwards_y: FieldElement,
+  }
+
+  // https://www.ietf.org/archive/id/draft-ietf-lwig-curve-representations-02.pdf E.2
+  fn to_ed_derivatives(point: EdwardsPoint) -> Option<EdDerivatives> {
+    if bool::from(point.is_identity()) {
+      None?;
+    }
+
+    // Extract the y coordinate from the compressed point
+    let mut edwards_y = point.to_bytes();
+    let x_is_odd = edwards_y[31] >> 7;
+    edwards_y[31] &= (1 << 7) - 1;
+    let edwards_y = FieldElement::from_repr(edwards_y)
+      .expect("valid point compressed had an invalid coordinate");
+
+    // Calculate the x and y coordinates for Wei25519
+    let edwards_y_plus_one = FieldElement::ONE + edwards_y;
+    let one_minus_edwards_y = FieldElement::ONE - edwards_y;
+
+    Some(EdDerivatives{
+      x_is_odd,
+      edwards_y,
+      edwards_y_plus_one,
+      one_minus_edwards_y
+    })
+  }
+
+  // https://www.ietf.org/archive/id/draft-ietf-lwig-curve-representations-02.pdf E.2
+  fn to_x(ed_derivatives: &EdDerivatives) -> FieldElement {
+    const Y_TO_X_MAP_CONST: FieldElement = FieldElement::from_u256(
+      &DynResidue::new(&U256::from_u64(486_662), MODULUS)
+        .mul(&DynResidue::new(&U256::from_u64(3), MODULUS).invert().0)
+        .retrieve(),
+    );
+
+    let wei_x = (ed_derivatives.edwards_y_plus_one *
+      ed_derivatives.one_minus_edwards_y
+        .invert()
+        .expect("couldn't map non-identity Ed25519 point's y coordinate to Wei25519 x")) +
+      Y_TO_X_MAP_CONST;
+
+    wei_x
+  }
+
   impl crate::DivisorCurve for EdwardsPoint {
     type FieldElement = FieldElement;
     type XyPoint = Projective<Self>;
@@ -579,13 +643,11 @@ mod ed25519 {
     // Wei25519 a/b
     // https://www.ietf.org/archive/id/draft-ietf-lwig-curve-representations-02.pdf E.3
     fn a() -> Self::FieldElement {
-      use crypto_bigint::U256;
       Self::FieldElement::from_u256(&U256::from_be_hex(
         "2aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa984914a144",
       ))
     }
     fn b() -> Self::FieldElement {
-      use crypto_bigint::U256;
       Self::FieldElement::from_u256(&U256::from_be_hex(
         "7b425ed097b425ed097b425ed097b425ed097b425ed097b4260b5e9c7710c864",
       ))
@@ -599,27 +661,18 @@ mod ed25519 {
     }
 
     // https://www.ietf.org/archive/id/draft-ietf-lwig-curve-representations-02.pdf E.2
+    fn to_x(point: Self) -> Option<Self::FieldElement> {
+      let ed_derivatives = to_ed_derivatives(point)?;
+      Some(to_x(&ed_derivatives))
+    }
+
+    // https://www.ietf.org/archive/id/draft-ietf-lwig-curve-representations-02.pdf E.2
     fn to_xy(point: Self) -> Option<(Self::FieldElement, Self::FieldElement)> {
-      if bool::from(point.is_identity()) {
-        None?;
-      }
-
-      // Extract the y coordinate from the compressed point
-      let mut edwards_y = point.to_bytes();
-      let x_is_odd = edwards_y[31] >> 7;
-      edwards_y[31] &= (1 << 7) - 1;
-      let edwards_y = Self::FieldElement::from_repr(edwards_y)
-        .expect("valid point compressed had an invalid coordinate");
-
-      use crypto_bigint::{
-        modular::runtime_mod::{DynResidueParams, DynResidue},
-        U256,
-      };
-      const MODULUS: DynResidueParams<{ U256::LIMBS }> =
-        DynResidueParams::new(&U256::ONE.shl_vartime(255).wrapping_sub(&U256::from_u64(19)));
+      let ed_derivatives = to_ed_derivatives(point)?;
+      let wei_x = to_x(&ed_derivatives);
 
       // Recover the x coordinate
-      let edwards_y_sq = edwards_y * edwards_y;
+      let edwards_y_sq = ed_derivatives.edwards_y * ed_derivatives.edwards_y;
 
       const D: FieldElement = FieldElement::from_u256(
         &DynResidue::new(&U256::from_u64(121_665), MODULUS)
@@ -639,23 +692,8 @@ mod ed25519 {
       edwards_x = <_>::conditional_select(
         &edwards_x,
         &-edwards_x,
-        edwards_x.is_odd() ^ Choice::from(x_is_odd),
+        edwards_x.is_odd() ^ Choice::from(ed_derivatives.x_is_odd),
       );
-
-      const Y_TO_X_MAP_CONST: FieldElement = FieldElement::from_u256(
-        &DynResidue::new(&U256::from_u64(486_662), MODULUS)
-          .mul(&DynResidue::new(&U256::from_u64(3), MODULUS).invert().0)
-          .retrieve(),
-      );
-
-      // Calculate the x and y coordinates for Wei25519
-      let edwards_y_plus_one = Self::FieldElement::ONE + edwards_y;
-      let one_minus_edwards_y = Self::FieldElement::ONE - edwards_y;
-      let wei_x = (edwards_y_plus_one *
-        one_minus_edwards_y
-          .invert()
-          .expect("couldn't map non-identity Ed25519 point's y coordinate to Wei25519 x")) +
-        Y_TO_X_MAP_CONST;
 
       const C_SQUARE: DynResidue<{ U256::LIMBS }> =
         DynResidue::new(&U256::from_u64(486_662 + 2), MODULUS).neg();
@@ -669,8 +707,8 @@ mod ed25519 {
       debug_assert_eq!(C.square(), FieldElement::from_u256(&C_SQUARE.retrieve()));
 
       let wei_y = C *
-        edwards_y_plus_one *
-        (one_minus_edwards_y * edwards_x)
+        ed_derivatives.edwards_y_plus_one *
+        (ed_derivatives.one_minus_edwards_y * edwards_x)
           .invert()
           .expect("couldn't map non-identity Ed25519 point's x coordinate to Wei25519 y");
       Some((wei_x, wei_y))
